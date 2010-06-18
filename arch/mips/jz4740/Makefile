@@ -7,6 +7,7 @@
 obj-y += prom.o irq.o time.o reset.o setup.o dma.o \
 	gpio.o clock.o platform.o timer.o pwm.o serial.o
 
+obj-$(CONFIG_PROC_FS)		+= proc.o
 obj-$(CONFIG_DEBUG_FS) += clock-debugfs.o
 
 # board specific support
