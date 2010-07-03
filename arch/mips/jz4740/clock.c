@@ -1,5 +1,8 @@
 /*
+ *  Copyright (c) 2006-2007, Ingenic Semiconductor Inc.
  *  Copyright (C) 2010, Lars-Peter Clausen <lars@metafoo.de>
+ *  Copyright (c) 2010, Ulrich Hecht <ulrich.hecht@gmail.com>
+ *  Copyright (c) 2010, Maarten ter Huurne <maarten@treewalker.org>
  *  JZ4740 SoC clock support
  *
  *  This program is free software; you can redistribute	 it and/or modify it
@@ -90,6 +93,7 @@
 #define JZ_CLOCK_PLL_M_OFFSET		23
 #define JZ_CLOCK_PLL_N_OFFSET		18
 #define JZ_CLOCK_PLL_OD_OFFSET		16
+#define JZ_CLOCK_PLL_STABILIZE_OFFSET	0
 
 #define JZ_CLOCK_LOW_POWER_MODE_DOZE BIT(2)
 #define JZ_CLOCK_LOW_POWER_MODE_SLEEP BIT(0)
@@ -97,9 +101,14 @@
 #define JZ_CLOCK_SLEEP_CTRL_SUSPEND_UHC BIT(7)
 #define JZ_CLOCK_SLEEP_CTRL_ENABLE_UDC BIT(6)
 
+#define JZ_REG_EMC_RTCNT	0x88
+#define JZ_REG_EMC_RTCOR	0x8C
+
 static void __iomem *jz_clock_base;
 static spinlock_t jz_clock_lock;
 static LIST_HEAD(jz_clocks);
+
+static void __iomem *jz_emc_base;
 
 struct main_clk {
 	struct clk clk;
@@ -204,25 +213,79 @@ static int jz_clk_ko_is_enabled(struct clk *clk)
 	return !!(jz_clk_reg_read(JZ_REG_CLOCK_CTRL) & JZ_CLOCK_CTRL_KO_ENABLE);
 }
 
+static struct static_clk jz_clk_ext;
+
+static unsigned long jz_clk_pll_calc_rate(
+	unsigned int in_div, unsigned int feedback, unsigned int out_div)
+{
+	return ((jz_clk_ext.rate / in_div) * feedback) / out_div;
+}
+
+static void jz_clk_pll_calc_dividers(unsigned long rate,
+	unsigned int *in_div, unsigned int *feedback, unsigned int *out_div)
+{
+	unsigned int target;
+
+	/* The frequency after the input divider must be between 1 and 15 MHz.
+	   The highest divider yields the best resolution. */
+	*in_div = jz_clk_ext.rate / 1000000;
+	if (*in_div >= 34)
+		*in_div = 33;
+
+	/* The frequency before the output divider must be between 100 and
+	   500 MHz. The highest divider yields the best resolution. */
+	if (rate < 25000000) {
+		*out_div = 4;
+		target = 25000000 * 4;
+	} else if (rate <= 125000000) {
+		*out_div = 4;
+		target = rate * 4;
+	} else if (rate <= 250000000) {
+		*out_div = 2;
+		target = rate * 2;
+	} else if (rate <= 500000000) {
+		*out_div = 1;
+		target = rate;
+	} else {
+		*out_div = 1;
+		target = 500000000;
+	}
+
+	/* Compute the feedback divider.
+	   Since the divided input is at least 1 MHz and the target frequency
+	   at most 500 MHz, the feedback will be at most 500 and will therefore
+	   always fit in the 9-bit register.
+	   Similarly, the divided input is at most 15 MHz and the target
+	   frequency at least 100 MHz, so the feedback will be at least 6
+	   where the minimum supported value is 2. */
+	*feedback = ((target / 1000) * *in_div) / (jz_clk_ext.rate / 1000);
+}
+
+static unsigned long jz_clk_pll_round_rate(struct clk *clk, unsigned long rate)
+{
+	unsigned int in_div, feedback, out_div;
+
+	jz_clk_pll_calc_dividers(rate, &in_div, &feedback, &out_div);
+	return jz_clk_pll_calc_rate(in_div, feedback, out_div);
+}
+
 static const int pllno[] = {1, 2, 2, 4};
 
 static unsigned long jz_clk_pll_get_rate(struct clk *clk)
 {
 	uint32_t val;
-	int m;
-	int n;
-	int od;
+	unsigned int in_div, feedback, out_div;
 
 	val = jz_clk_reg_read(JZ_REG_CLOCK_PLL);
 
 	if (val & JZ_CLOCK_PLL_BYPASS)
 		return clk_get_rate(clk->parent);
 
-	m = ((val >> 23) & 0x1ff) + 2;
-	n = ((val >> 18) & 0x1f) + 2;
-	od = (val >> 16) & 0x3;
+	feedback = ((val >> 23) & 0x1ff) + 2;
+	in_div = ((val >> 18) & 0x1f) + 2;
+	out_div = pllno[(val >> 16) & 0x3];
 
-	return clk_get_rate(clk->parent) * (m / n) / pllno[od];
+	return jz_clk_pll_calc_rate(in_div, feedback, out_div);
 }
 
 static unsigned long jz_clk_pll_half_get_rate(struct clk *clk)
@@ -233,6 +296,105 @@ static unsigned long jz_clk_pll_half_get_rate(struct clk *clk)
 	if (reg & JZ_CLOCK_CTRL_PLL_HALF)
 		return jz_clk_pll_get_rate(clk->parent);
 	return jz_clk_pll_get_rate(clk->parent) >> 1;
+}
+
+#define SDRAM_TREF 15625   /* Refresh period: 4096 refresh cycles/64ms */
+
+static unsigned int sdram_convert(unsigned int pllin)
+{
+	unsigned int ns, ret;
+
+	ns = 1000000000 / pllin;
+	ret = (SDRAM_TREF / ns) / 64 + 1;
+	if (ret > 0xff) ret = 0xff;
+	return ret;
+}
+
+static struct main_clk jz_clk_cpu;
+
+static int jz_clk_pll_set_rate(struct clk *clk, unsigned long rate)
+{
+	unsigned int cfcr, plcr1;
+	unsigned int sdramclock;
+	unsigned int tmp = 0;
+	unsigned int wait =
+		((clk_get_rate(&jz_clk_cpu.clk) / 1000000) * 500) / 1000;
+	int n2FR[33] = {
+		0, 0, 1, 2, 3, 0, 4, 0, 5, 0, 0, 0, 6, 0, 0, 0,
+		7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0,
+		9
+	};
+	int div[5] = {1, 3, 3, 3, 3}; /* divisors of I:S:P:L:M */
+	unsigned int feedback, in_div, out_div, pllout, pllout2;
+
+	jz_clk_pll_calc_dividers(rate, &in_div, &feedback, &out_div);
+
+	cfcr = JZ_CLOCK_CTRL_KO_ENABLE |
+		(n2FR[div[0]] << JZ_CLOCK_CTRL_CDIV_OFFSET) |
+		(n2FR[div[1]] << JZ_CLOCK_CTRL_HDIV_OFFSET) |
+		(n2FR[div[2]] << JZ_CLOCK_CTRL_PDIV_OFFSET) |
+		(n2FR[div[3]] << JZ_CLOCK_CTRL_MDIV_OFFSET) |
+		(n2FR[div[4]] << JZ_CLOCK_CTRL_LDIV_OFFSET);
+
+	pllout = jz_clk_pll_calc_rate(in_div, feedback, out_div);
+	pllout2 = (cfcr & JZ_CLOCK_CTRL_PLL_HALF) ? pllout : (pllout / 2);
+
+	/* Init UHC clock */
+	writel(pllout2 / 48000000 - 1, jz_clock_base + JZ_REG_CLOCK_UHC);
+
+	plcr1 = ((feedback - 2) << JZ_CLOCK_PLL_M_OFFSET) |
+		((in_div - 2) << JZ_CLOCK_PLL_N_OFFSET) |
+		((out_div - 1) << JZ_CLOCK_PLL_OD_OFFSET) |
+		(0x20 << JZ_CLOCK_PLL_STABILIZE_OFFSET) |
+		JZ_CLOCK_PLL_ENABLED;
+
+	sdramclock = sdram_convert(rate);
+	if (sdramclock > 0) {
+		/* Set refresh registers */
+		writew(sdramclock, jz_emc_base + JZ_REG_EMC_RTCOR);
+		writew(sdramclock, jz_emc_base + JZ_REG_EMC_RTCNT);
+	} else {
+		BUG();
+	}
+
+	/* init PLL */
+	/* delay loops lifted from the old Ingenic cpufreq driver */
+	__asm__ __volatile__(
+		".set noreorder\n\t"
+		".align 5\n"
+		"sw %1,0(%0)\n\t"
+		"li %3,0\n\t"
+		"1:\n\t"
+		"bne %3,%2,1b\n\t"
+		"addi %3, 1\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		".set reorder\n\t"
+		:
+		: "r" (jz_clock_base + JZ_REG_CLOCK_CTRL), "r" (cfcr),
+		  "r" (wait), "r" (tmp));
+
+	/* LCD pixclock */
+	writel(rate / 12000000 / 2 - 1, jz_clock_base + JZ_REG_CLOCK_LCD);
+
+	__asm__ __volatile__(
+		".set noreorder\n\t"
+		".align 5\n"
+		"sw %1,0(%0)\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		".set reorder\n\t"
+		:
+		: "r" (jz_clock_base + JZ_REG_CLOCK_PLL), "r" (plcr1));
+
+	return 0;
 }
 
 static const int jz_clk_main_divs[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32};
@@ -306,7 +468,9 @@ static struct static_clk jz_clk_ext = {
 };
 
 static struct clk_ops jz_clk_pll_ops = {
-	.get_rate = jz_clk_static_get_rate,
+	.get_rate = jz_clk_pll_get_rate,
+	.set_rate = jz_clk_pll_set_rate,
+	.round_rate = jz_clk_pll_round_rate,
 };
 
 static struct clk jz_clk_pll = {
@@ -598,17 +762,7 @@ static const struct clk_ops jz_clk_divided_ops = {
 };
 
 static struct divided_clk jz4740_clock_divided_clks[] = {
-	{
-		.clk = {
-			.name = "lcd_pclk",
-			.parent = &jz_clk_pll_half,
-			.gate_bit = JZ4740_CLK_NOT_GATED,
-			.ops = &jz_clk_divided_ops,
-		},
-		.reg = JZ_REG_CLOCK_LCD,
-		.mask = JZ_CLOCK_LCD_DIV_MASK,
-	},
-	{
+	[0] = {
 		.clk = {
 			.name = "i2s",
 			.parent = &jz_clk_ext.clk,
@@ -618,7 +772,7 @@ static struct divided_clk jz4740_clock_divided_clks[] = {
 		.reg = JZ_REG_CLOCK_I2S,
 		.mask = JZ_CLOCK_I2S_DIV_MASK,
 	},
-	{
+	[1] = {
 		.clk = {
 			.name = "spi",
 			.parent = &jz_clk_ext.clk,
@@ -628,7 +782,17 @@ static struct divided_clk jz4740_clock_divided_clks[] = {
 		.reg = JZ_REG_CLOCK_SPI,
 		.mask = JZ_CLOCK_SPI_DIV_MASK,
 	},
-	{
+	[2] = {
+		.clk = {
+			.name = "lcd_pclk",
+			.parent = &jz_clk_pll_half,
+			.gate_bit = JZ4740_CLK_NOT_GATED,
+			.ops = &jz_clk_divided_ops,
+		},
+		.reg = JZ_REG_CLOCK_LCD,
+		.mask = JZ_CLOCK_LCD_DIV_MASK,
+	},
+	[3] = {
 		.clk = {
 			.name = "mmc",
 			.parent = &jz_clk_pll_half,
@@ -638,7 +802,7 @@ static struct divided_clk jz4740_clock_divided_clks[] = {
 		.reg = JZ_REG_CLOCK_MMC,
 		.mask = JZ_CLOCK_MMC_DIV_MASK,
 	},
-	{
+	[4] = {
 		.clk = {
 			.name = "uhc",
 			.parent = &jz_clk_pll_half,
@@ -666,48 +830,48 @@ static const struct clk_ops jz_clk_simple_ops = {
 };
 
 static struct clk jz4740_clock_simple_clks[] = {
-	{
+	[0] = {
 		.name = "udc",
 		.parent = &jz_clk_ext.clk,
 		.ops = &jz_clk_udc_ops,
 	},
-	{
+	[1] = {
 		.name = "uart0",
 		.parent = &jz_clk_ext.clk,
 		.gate_bit = JZ_CLOCK_GATE_UART0,
 		.ops = &jz_clk_simple_ops,
 	},
-	{
+	[2] = {
 		.name = "uart1",
 		.parent = &jz_clk_ext.clk,
 		.gate_bit = JZ_CLOCK_GATE_UART1,
 		.ops = &jz_clk_simple_ops,
 	},
-	{
+	[3] = {
 		.name = "dma",
 		.parent = &jz_clk_high_speed_peripheral.clk,
 		.gate_bit = JZ_CLOCK_GATE_UART0,
 		.ops = &jz_clk_simple_ops,
 	},
-	{
+	[4] = {
 		.name = "ipu",
 		.parent = &jz_clk_high_speed_peripheral.clk,
 		.gate_bit = JZ_CLOCK_GATE_IPU,
 		.ops = &jz_clk_simple_ops,
 	},
-	{
+	[5] = {
 		.name = "adc",
 		.parent = &jz_clk_ext.clk,
 		.gate_bit = JZ_CLOCK_GATE_ADC,
 		.ops = &jz_clk_simple_ops,
 	},
-	{
+	[6] = {
 		.name = "i2c",
 		.parent = &jz_clk_ext.clk,
 		.gate_bit = JZ_CLOCK_GATE_I2C,
 		.ops = &jz_clk_simple_ops,
 	},
-	{
+	[7] = {
 		.name = "aic",
 		.parent = &jz_clk_ext.clk,
 		.gate_bit = JZ_CLOCK_GATE_AIC,
@@ -779,13 +943,17 @@ EXPORT_SYMBOL_GPL(clk_round_rate);
 int clk_set_parent(struct clk *clk, struct clk *parent)
 {
 	int ret;
+	int enabled;
 
 	if (!clk->ops->set_parent)
 		return -EINVAL;
 
-	clk_disable(clk);
+	enabled = clk_is_enabled(clk);
+	if (enabled)
+		clk_disable(clk);
 	ret = clk->ops->set_parent(clk, parent);
-	clk_enable(clk);
+	if (enabled)
+		clk_enable(clk);
 
 	jz4740_clock_debugfs_update_parent(clk);
 
@@ -891,6 +1059,10 @@ int jz4740_clock_init(void)
 
 	jz_clock_base = ioremap(CPHYSADDR(JZ4740_CPM_BASE_ADDR), 0x100);
 	if (!jz_clock_base)
+		return -EBUSY;
+
+	jz_emc_base = ioremap(CPHYSADDR(JZ4740_EMC_BASE_ADDR), 0x100);
+	if (!jz_emc_base)
 		return -EBUSY;
 
 	spin_lock_init(&jz_clock_lock);

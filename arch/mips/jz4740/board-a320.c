@@ -79,13 +79,6 @@ static struct platform_device a320_i2c_device = {
 
 /* NAND */
 static struct nand_ecclayout a320_ecclayout_4gb = {
-	.eccbytes = 36,
-	.eccpos = {
-		6,  7,  8,  9,				/* IPL code expects */
-		10, 11, 12, 13, 14, 15, 16, 17,		/* 36 bytes of RS ECC */
-		18, 19, 20, 21, 22, 23, 24, 25,		/* at offset 6 */
-		26, 27, 28, 29, 30, 31, 32, 33,
-		34, 35, 36, 37, 38, 39, 40, 41},
 	.oobfree = {
 		{.offset = 42,
 		 .length = 22}}
@@ -194,7 +187,7 @@ static struct gpio_charger_platform_data a320_charger_pdata = {
 	.name = "usb",
 	.type = POWER_SUPPLY_TYPE_USB,
 	.gpio = JZ_GPIO_PORTD(28),
-	.gpio_active_low = 1,
+	.gpio_active_low = 0,
 	.batteries = a320_batteries,
 	.num_batteries = ARRAY_SIZE(a320_batteries),
 };
@@ -309,6 +302,11 @@ static int __init a320_board_setup(void)
 	panic_blink = a320_panic_blink_callback;
 
 	jz4740_clock_init();
+
+	/* Disable pullup of the USB detection pin: on the A320 pullup or not
+	   seems to make no difference, but on A330 the signal will be unstable
+	   when the pullup is enabled. */
+	jz_gpio_disable_pullup(JZ_GPIO_PORTD(28));
 
 	if (a320_init_platform_devices())
 		panic("Failed to initalize platform devices\n");
