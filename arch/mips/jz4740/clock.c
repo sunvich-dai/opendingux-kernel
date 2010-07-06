@@ -44,16 +44,20 @@
 #define JZ_CLOCK_CTRL_I2S_SRC_PLL	BIT(31)
 #define JZ_CLOCK_CTRL_KO_ENABLE		BIT(30)
 #define JZ_CLOCK_CTRL_UDC_SRC_PLL	BIT(29)
-#define JZ_CLOCK_CTRL_UDIV_MASK		0x1f800000
 #define JZ_CLOCK_CTRL_CHANGE_ENABLE	BIT(22)
 #define JZ_CLOCK_CTRL_PLL_HALF		BIT(21)
-#define JZ_CLOCK_CTRL_LDIV_MASK		0x001f0000
 #define JZ_CLOCK_CTRL_UDIV_OFFSET	23
 #define JZ_CLOCK_CTRL_LDIV_OFFSET	16
 #define JZ_CLOCK_CTRL_MDIV_OFFSET	12
 #define JZ_CLOCK_CTRL_PDIV_OFFSET	 8
 #define JZ_CLOCK_CTRL_HDIV_OFFSET	 4
 #define JZ_CLOCK_CTRL_CDIV_OFFSET	 0
+#define JZ_CLOCK_CTRL_UDIV_MASK		(0x3f << JZ_CLOCK_CTRL_UDIV_OFFSET)
+#define JZ_CLOCK_CTRL_LDIV_MASK		(0x1f << JZ_CLOCK_CTRL_LDIV_OFFSET)
+#define JZ_CLOCK_CTRL_MDIV_MASK		(0x1f << JZ_CLOCK_CTRL_MDIV_OFFSET)
+#define JZ_CLOCK_CTRL_PDIV_MASK		(0x1f << JZ_CLOCK_CTRL_PDIV_OFFSET)
+#define JZ_CLOCK_CTRL_HDIV_MASK		(0x1f << JZ_CLOCK_CTRL_HDIV_OFFSET)
+#define JZ_CLOCK_CTRL_CDIV_MASK		(0x1f << JZ_CLOCK_CTRL_CDIV_OFFSET)
 
 #define JZ_CLOCK_GATE_UART0	BIT(0)
 #define JZ_CLOCK_GATE_TCU	BIT(1)
@@ -233,14 +237,14 @@ static void jz_clk_pll_calc_dividers(unsigned long rate,
 		*in_div = 33;
 
 	/* The frequency before the output divider must be between 100 and
-	   500 MHz. The highest divider yields the best resolution. */
+	   500 MHz. The lowest target rate is more energy efficient. */
 	if (rate < 25000000) {
 		*out_div = 4;
 		target = 25000000 * 4;
-	} else if (rate <= 125000000) {
+	} else if (rate <= 50000000) {
 		*out_div = 4;
 		target = rate * 4;
-	} else if (rate <= 250000000) {
+	} else if (rate <= 100000000) {
 		*out_div = 2;
 		target = rate * 2;
 	} else if (rate <= 500000000) {
@@ -300,44 +304,28 @@ static unsigned long jz_clk_pll_half_get_rate(struct clk *clk)
 
 #define SDRAM_TREF 15625   /* Refresh period: 4096 refresh cycles/64ms */
 
-static unsigned int sdram_convert(unsigned int pllin)
+static void sdram_set_pll(unsigned int pllin)
 {
-	unsigned int ns, ret;
+	unsigned int ns, sdramclock;
 
 	ns = 1000000000 / pllin;
-	ret = (SDRAM_TREF / ns) / 64 + 1;
-	if (ret > 0xff) ret = 0xff;
-	return ret;
+	sdramclock = (SDRAM_TREF / ns) / 64 + 1;
+	if (sdramclock > 0xff) sdramclock = 0xff;
+	/* Set refresh registers */
+	writew(sdramclock, jz_emc_base + JZ_REG_EMC_RTCOR);
+	writew(sdramclock, jz_emc_base + JZ_REG_EMC_RTCNT);
 }
-
-static struct main_clk jz_clk_cpu;
 
 static int jz_clk_pll_set_rate(struct clk *clk, unsigned long rate)
 {
-	unsigned int cfcr, plcr1;
-	unsigned int sdramclock;
-	unsigned int tmp = 0;
-	unsigned int wait =
-		((clk_get_rate(&jz_clk_cpu.clk) / 1000000) * 500) / 1000;
-	int n2FR[33] = {
-		0, 0, 1, 2, 3, 0, 4, 0, 5, 0, 0, 0, 6, 0, 0, 0,
-		7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0,
-		9
-	};
-	int div[5] = {1, 3, 3, 3, 3}; /* divisors of I:S:P:L:M */
+	unsigned int ctrl, plcr1;
 	unsigned int feedback, in_div, out_div, pllout, pllout2;
 
 	jz_clk_pll_calc_dividers(rate, &in_div, &feedback, &out_div);
 
-	cfcr = JZ_CLOCK_CTRL_KO_ENABLE |
-		(n2FR[div[0]] << JZ_CLOCK_CTRL_CDIV_OFFSET) |
-		(n2FR[div[1]] << JZ_CLOCK_CTRL_HDIV_OFFSET) |
-		(n2FR[div[2]] << JZ_CLOCK_CTRL_PDIV_OFFSET) |
-		(n2FR[div[3]] << JZ_CLOCK_CTRL_MDIV_OFFSET) |
-		(n2FR[div[4]] << JZ_CLOCK_CTRL_LDIV_OFFSET);
-
+	ctrl = jz_clk_reg_read(JZ_REG_CLOCK_CTRL);
 	pllout = jz_clk_pll_calc_rate(in_div, feedback, out_div);
-	pllout2 = (cfcr & JZ_CLOCK_CTRL_PLL_HALF) ? pllout : (pllout / 2);
+	pllout2 = (ctrl & JZ_CLOCK_CTRL_PLL_HALF) ? pllout : (pllout / 2);
 
 	/* Init UHC clock */
 	writel(pllout2 / 48000000 - 1, jz_clock_base + JZ_REG_CLOCK_UHC);
@@ -348,37 +336,12 @@ static int jz_clk_pll_set_rate(struct clk *clk, unsigned long rate)
 		(0x20 << JZ_CLOCK_PLL_STABILIZE_OFFSET) |
 		JZ_CLOCK_PLL_ENABLED;
 
-	sdramclock = sdram_convert(rate);
-	if (sdramclock > 0) {
-		/* Set refresh registers */
-		writew(sdramclock, jz_emc_base + JZ_REG_EMC_RTCOR);
-		writew(sdramclock, jz_emc_base + JZ_REG_EMC_RTCNT);
-	} else {
-		BUG();
-	}
-
-	/* init PLL */
-	/* delay loops lifted from the old Ingenic cpufreq driver */
-	__asm__ __volatile__(
-		".set noreorder\n\t"
-		".align 5\n"
-		"sw %1,0(%0)\n\t"
-		"li %3,0\n\t"
-		"1:\n\t"
-		"bne %3,%2,1b\n\t"
-		"addi %3, 1\n\t"
-		"nop\n\t"
-		"nop\n\t"
-		"nop\n\t"
-		"nop\n\t"
-		".set reorder\n\t"
-		:
-		: "r" (jz_clock_base + JZ_REG_CLOCK_CTRL), "r" (cfcr),
-		  "r" (wait), "r" (tmp));
+	sdram_set_pll(pllout);
 
 	/* LCD pixclock */
-	writel(rate / 12000000 / 2 - 1, jz_clock_base + JZ_REG_CLOCK_LCD);
+	writel(pllout2 / 12000000 - 1, jz_clock_base + JZ_REG_CLOCK_LCD);
 
+	/* configure PLL */
 	__asm__ __volatile__(
 		".set noreorder\n\t"
 		".align 5\n"
@@ -398,6 +361,11 @@ static int jz_clk_pll_set_rate(struct clk *clk, unsigned long rate)
 }
 
 static const int jz_clk_main_divs[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32};
+static const int jz_clk_main_divs_inv[] = {
+	0, 0, 1, 2, 3, 0, 4, 0, 5, 0, 0, 0, 6, 0, 0, 0,
+	7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0,
+	9
+};
 
 static unsigned long jz_clk_main_round_rate(struct clk *clk, unsigned long rate)
 {
@@ -451,6 +419,45 @@ static int jz_clk_main_set_rate(struct clk *clk, unsigned long rate)
 
 	return 0;
 }
+
+static struct main_clk jz_clk_cpu;
+
+void clk_main_set_dividers(bool immediate, unsigned int cdiv, unsigned int hdiv,
+			   unsigned int mdiv, unsigned int pdiv)
+{
+	unsigned int tmp = 0;
+	unsigned int wait =
+		((clk_get_rate(&jz_clk_cpu.clk) / 1000000) * 500) / 1000;
+	unsigned int ctrl = jz_clk_reg_read(JZ_REG_CLOCK_CTRL);
+	ctrl &= ~(JZ_CLOCK_CTRL_CHANGE_ENABLE |
+		  JZ_CLOCK_CTRL_CDIV_MASK | JZ_CLOCK_CTRL_HDIV_MASK |
+		  JZ_CLOCK_CTRL_MDIV_MASK | JZ_CLOCK_CTRL_PDIV_MASK);
+	if (immediate) ctrl |= JZ_CLOCK_CTRL_CHANGE_ENABLE;
+	ctrl |= (jz_clk_main_divs_inv[cdiv] << JZ_CLOCK_CTRL_CDIV_OFFSET) |
+		(jz_clk_main_divs_inv[hdiv] << JZ_CLOCK_CTRL_HDIV_OFFSET) |
+		(jz_clk_main_divs_inv[mdiv] << JZ_CLOCK_CTRL_MDIV_OFFSET) |
+		(jz_clk_main_divs_inv[pdiv] << JZ_CLOCK_CTRL_PDIV_OFFSET);
+
+	/* set dividers */
+	/* delay loops lifted from the old Ingenic cpufreq driver */
+	__asm__ __volatile__(
+		".set noreorder\n\t"
+		".align 5\n"
+		"sw %1,0(%0)\n\t"
+		"li %3,0\n\t"
+		"1:\n\t"
+		"bne %3,%2,1b\n\t"
+		"addi %3, 1\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		"nop\n\t"
+		".set reorder\n\t"
+		:
+		: "r" (jz_clock_base + JZ_REG_CLOCK_CTRL), "r" (ctrl),
+		  "r" (wait), "r" (tmp));
+}
+EXPORT_SYMBOL_GPL(clk_main_set_dividers);
 
 static struct clk_ops jz_clk_static_ops = {
 	.get_rate = jz_clk_static_get_rate,
