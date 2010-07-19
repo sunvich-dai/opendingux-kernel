@@ -22,9 +22,6 @@
 #include <linux/gpio.h>
 #include <linux/i2c.h>
 #include <linux/i2c-gpio.h>
-#include <linux/jz4740_fb.h>
-#include <linux/mmc/jz4740_mmc.h>
-#include <linux/mtd/jz4740_nand.h>
 #include <linux/power_supply.h>
 #include <linux/power/gpio-charger.h>
 #include <linux/power/jz4740-battery.h>
@@ -38,8 +35,11 @@
 #include <asm/mipsregs.h>
 #include <asm/reboot.h>
 
-#include <asm/mach-jz4740/platform.h>
 #include <asm/mach-jz4740/gpio.h>
+#include <asm/mach-jz4740/jz4740_fb.h>
+#include <asm/mach-jz4740/jz4740_mmc.h>
+#include <asm/mach-jz4740/jz4740_nand.h>
+#include <asm/mach-jz4740/platform.h>
 
 #include "clock.h"
 
@@ -149,6 +149,7 @@ static struct jz_nand_platform_data a320_nand_pdata = {
 	.partitions		= a320_nand_partitions,
 	.ecc_layout		= &a320_nand_ecc_layout,
 	.busy_gpio		= JZ_GPIO_PORTC(30),
+	.banks			= { 1, 2 },
 	.ident_callback		= a320_nand_ident,
 };
 
